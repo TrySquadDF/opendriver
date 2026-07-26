@@ -1,6 +1,13 @@
 import { BYTE_MASK, BITS_IN_BYTE } from "./bytes/consts";
 
+// Runtime-бренд типа поля. Позволяет engine'у проверять, что ссылки по имени
+// (lengthField, checksum.field) указывают на числовое поле, а не на data-блок.
+// Без этой проверки lenField.encode(buf, number) на data-поле — тихий no-op
+// (Uint8Array.prototype.set(number) ничего не пишет), и пакет уходит битым.
+export type FieldKind = 'uint' | 'data';
+
 export interface FieldDef<TType> {
+  readonly kind: FieldKind;
   readonly offset: number;
   readonly size: number;
   encode(buffer: Uint8Array, value: TType): void;
@@ -8,6 +15,7 @@ export interface FieldDef<TType> {
 }
 
 export interface TypeDef<TType> {
+  readonly kind: FieldKind;
   readonly size: number;
   write(buffer: Uint8Array, offset: number, value: TType): void;
   read(buffer: Uint8Array, offset: number): TType;
@@ -18,7 +26,10 @@ export interface DataFieldDef extends FieldDef<Uint8Array> {
   readonly maxLength: number;
 }
 
-export interface EndianTypeDef<TType> extends TypeDef<TType> {
+// Пара BE/LE без «дефолтного» порядка байт. Порядок всегда указывается явно:
+// u16.be / u16.le. Неявный дефолт (раньше — BE) — источник многочасовой отладки:
+// HID/USB-протоколы почти всегда little-endian.
+export interface EndianTypeDef<TType> {
   readonly be: TypeDef<TType>;
   readonly le: TypeDef<TType>;
 }
@@ -87,11 +98,13 @@ function assertBufferRange(buffer: Uint8Array, offset: number, size: number): vo
 }
 
 function createType<TType>(
+  kind: FieldKind,
   size: number,
   writer: (buf: Uint8Array, offset: number, value: TType) => void,
   reader: (buf: Uint8Array, offset: number) => TType
 ): TypeDef<TType> {
   return {
+    kind,
     size,
     write: (buffer, offset, value) => {
       assertBufferRange(buffer, offset, size);
@@ -105,6 +118,7 @@ function createType<TType>(
       assertNonNegativeInteger(offset, 'Offset');
 
       return Object.freeze({
+        kind,
         offset,
         size,
         encode: (buffer: Uint8Array, value: TType) => {
@@ -120,53 +134,54 @@ function createType<TType>(
   };
 }
 
-function createIntType(size: BitwiseIntSize): EndianTypeDef<number> {
-  const maxValue = size === 4 ? 0xffff_ffff : 2 ** (size * BITS_IN_BYTE) - 1;
+// Ручные сдвиги, НЕ DataView — осознанное решение по замерам:
+// `new DataView(...)` на каждый read/write ~9x медленнее сдвигов, а для
+// драйвера с 1000 Гц polling'ом кодек — горячий путь. Корректность сдвигов
+// (включая знаковый `<<` на старшем байте u32 с коррекцией `>>> 0`)
+// закрыта property-тестами: test/property.test.ts.
+function createUintType(size: BitwiseIntSize, isBE: boolean): TypeDef<number> {
+  // 2**32 и 2**32 - 1 представимы в double точно, спецкейс не нужен.
+  const maxValue = 2 ** (size * BITS_IN_BYTE) - 1;
 
-  const makeType = (isBE: boolean): TypeDef<number> => {
+  // Для u16 BE: start=8, step=-8 (сдвиги: 8, 0)
+  // Для u16 LE: start=0, step=8  (сдвиги: 0, 8)
+  const startShift = isBE ? (size - 1) * BITS_IN_BYTE : 0;
+  const step = isBE ? -BITS_IN_BYTE : BITS_IN_BYTE;
 
-    // Для u16 BE: start=8, step=-8 (сдвиги: 8, 0)
-    // Для u16 LE: start=0, step=8  (сдвиги: 0, 8)
-    const startShift = isBE ? (size - 1) * BITS_IN_BYTE : 0;
-    const step = isBE ? -BITS_IN_BYTE : BITS_IN_BYTE;
-
-    return createType<number>(
-      size,
-      (buf, off, val) => {
-        if (!Number.isSafeInteger(val) || val < 0 || val > maxValue) {
-          throw new RangeError(
-            `Unsigned ${size * BITS_IN_BYTE}-bit value must be an integer from 0 to ${maxValue}, got ${val}`,
-          );
-        }
-
-        let shift = startShift;
-        for (let i = 0; i < size; i++) {
-          buf[off + i] = (val >>> shift) & BYTE_MASK;
-          shift += step;
-        }
-      },
-
-      (buf, off) => {
-        let val = 0;
-        let shift = startShift;
-        for (let i = 0; i < size; i++) {
-
-          val |= (buf[off + i] ?? 0) << shift;
-          shift += step;
-        }
-        return val >>> 0;
+  return createType<number>(
+    'uint',
+    size,
+    (buf, off, val) => {
+      if (!Number.isSafeInteger(val) || val < 0 || val > maxValue) {
+        throw new RangeError(
+          `Unsigned ${size * BITS_IN_BYTE}-bit value must be an integer from 0 to ${maxValue}, got ${val}`,
+        );
       }
-    );
-  };
 
-  const beType = makeType(true);
-  const leType = makeType(false);
+      let shift = startShift;
+      for (let i = 0; i < size; i++) {
+        buf[off + i] = (val >>> shift) & BYTE_MASK;
+        shift += step;
+      }
+    },
 
-  return {
-    ...beType,
-    be: beType,
-    le: leType,
-  };
+    (buf, off) => {
+      let val = 0;
+      let shift = startShift;
+      for (let i = 0; i < size; i++) {
+        val |= (buf[off + i] ?? 0) << shift;
+        shift += step;
+      }
+      return val >>> 0;
+    }
+  );
+}
+
+function createEndianPair(size: BitwiseIntSize): EndianTypeDef<number> {
+  return Object.freeze({
+    be: createUintType(size, true),
+    le: createUintType(size, false),
+  });
 }
 
 export const data = (opts: { lengthField?: string; maxLength: number }): DataFieldFactory => {
@@ -180,6 +195,9 @@ export const data = (opts: { lengthField?: string; maxLength: number }): DataFie
 
   const write: (buf: Uint8Array, offset: number, val: Uint8Array) => void = (buf, offset, val) => {
     assertBufferRange(buf, offset, maxLength);
+    if (!(val instanceof Uint8Array)) {
+      throw new TypeError(`Data field expects a Uint8Array payload, got ${typeof val}`);
+    }
     if (val.length > maxLength) {
       throw new Error(`Data length ${val.length} exceeds max capacity ${maxLength}`);
     }
@@ -192,8 +210,11 @@ export const data = (opts: { lengthField?: string; maxLength: number }): DataFie
   };
 
   return {
+    kind: 'data',
     size: maxLength,
-    lengthField,
+    // Условный спред — совместимость с exactOptionalPropertyTypes:
+    // отсутствие ключа вместо явного undefined.
+    ...(lengthField !== undefined ? { lengthField } : {}),
     maxLength,
     write,
     read,
@@ -202,6 +223,7 @@ export const data = (opts: { lengthField?: string; maxLength: number }): DataFie
       assertNonNegativeInteger(offset, 'Offset');
 
       return Object.freeze({
+        kind: 'data' as const,
         offset,
         size: maxLength,
         maxLength,
@@ -245,6 +267,16 @@ export const skip = (bytes: number): LayoutEntry => {
 export const isField = (e: LayoutEntry): e is readonly [string, TypeDef<unknown>] => Array.isArray(e);
 export const extractFieldsKeys = (fields: readonly LayoutEntry[] | undefined) => fields?.filter(isField).map(e => e[0]) || []
 
-export const u8 = createIntType(1);
-export const u16 = createIntType(2);
-export const u32 = createIntType(4);
+// u8 — один байт, порядок байт не имеет смысла; be/le — самоссылки,
+// чтобы сгенерированный/шаблонный код мог единообразно писать `.le`.
+const u8Type = createUintType(1, true);
+export const u8: TypeDef<number> & EndianTypeDef<number> = Object.freeze({
+  ...u8Type,
+  be: u8Type,
+  le: u8Type,
+});
+
+// ВНИМАНИЕ: у u16/u32 больше нет неявного порядка байт.
+// `['x', u16]` — ошибка компиляции; пишите `['x', u16.le]` или `['x', u16.be]`.
+export const u16: EndianTypeDef<number> = createEndianPair(2);
+export const u32: EndianTypeDef<number> = createEndianPair(4);

@@ -7,8 +7,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.mts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.mjs"
+      "import": "./dist/index.mjs"
     }
   },
   "files": [
@@ -20,10 +19,11 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "bun test",
     "test:watch": "bun test --watch",
-    "test:coverage": "bun test --coverage"
+    "test:coverage": "bun test --coverage",
+    "bench": "bun bench/codec.bench.ts"
   },
   "devDependencies": {
-    "tsdown": "0.22.4",
+    "tsdown": "0.22.14",
     "typescript": "catalog:",
     "@types/bun": "catalog:"
   }

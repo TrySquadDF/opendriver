@@ -26,9 +26,45 @@ type InferTupleFields<T extends readonly LayoutEntry[]> = {
     K extends readonly [unknown, infer Type] ? InferField<Type> : never;
 };
 
-export interface ChecksumConfig {
-  field: string;
-  calculate: (buffer: Uint8Array) => number;
+// FieldDef'ы блока, типизированные по именам и типам значений полей.
+type InferFieldDefs<T extends readonly LayoutEntry[]> = {
+  [K in T[number] as K extends readonly [infer Name extends string, unknown] ? Name : never]:
+    K extends readonly [unknown, infer Type] ? FieldDef<InferField<Type>> : never;
+};
+
+// `unknown` в пересечении — нейтральный элемент; защищает от «отравления»
+// индексной сигнатурой, когда блок не задан (generic-массив вместо tuple).
+type BlockFieldDefs<T extends readonly LayoutEntry[]> =
+  [ExtractFieldsKeys<T>] extends [never] ? unknown : InferFieldDefs<T>;
+
+// Публичная карта полей codec'а: typo в имени и обращение к skip-байтам —
+// ошибки типов; деградирует до Record при неконкретных tuple (нет as const).
+type ResolvedFields<
+  THead extends readonly LayoutEntry[],
+  TTail extends readonly LayoutEntry[],
+> = [ExtractFieldsKeys<THead> | ExtractFieldsKeys<TTail>] extends [never]
+  ? Readonly<Record<string, FieldDef<unknown>>>
+  : Readonly<BlockFieldDefs<THead> & BlockFieldDefs<TTail>>;
+
+// Имя поля для checksum, выведенное из layout'а. Если tuple не конкретен
+// (нет `as const`) — деградирует до string, а не до never.
+type FieldNameOf<
+  THead extends readonly LayoutEntry[],
+  TTail extends readonly LayoutEntry[],
+> = [ExtractFieldsKeys<THead> | ExtractFieldsKeys<TTail>] extends [never]
+  ? string
+  : ExtractFieldsKeys<THead> | ExtractFieldsKeys<TTail>;
+
+export interface ChecksumConfig<TField extends string = string> {
+  field: TField;
+  // Второй аргумент — позиция checksum-поля в буфере. Нужен для настоящих
+  // CRC (CRC16/CRC32): там «занулить поле» и «исключить байты из расчёта» —
+  // НЕ одно и то же. Буфер приходит с занулённым checksum-полем; если ваш
+  // протокол требует исключения байтов, используйте offset/size для среза.
+  //
+  // КОНТРАКТ: buffer — живой рабочий буфер (без копирования, см.
+  // calculateChecksum). Читать можно всё, МУТИРОВАТЬ НЕЛЬЗЯ.
+  calculate: (buffer: Uint8Array, field: { offset: number; size: number }) => number;
 }
 
 export interface PacketSchema<
@@ -39,9 +75,23 @@ export interface PacketSchema<
   head?: THead;
   body?: DataFieldFactory;
   tail?: TTail;
-  checksum?: ChecksumConfig;
+  checksum?: ChecksumConfig<FieldNameOf<THead, TTail>>;
 }
 
+// Форма для encode: body опционален (нет body — пустой payload),
+// пустые head/tail можно не передавать вовсе.
+export type PacketInput<
+  THead extends readonly LayoutEntry[],
+  TTail extends readonly LayoutEntry[]
+> = ([ExtractFieldsKeys<THead>] extends [never]
+      ? { head?: Record<string, unknown> }
+      : { head: InferTupleFields<THead> })
+  & { body?: Uint8Array }
+  & ([ExtractFieldsKeys<TTail>] extends [never]
+      ? { tail?: Record<string, unknown> }
+      : { tail: InferTupleFields<TTail> });
+
+// Форма результата decode: все блоки присутствуют всегда.
 export type InferPacketShape<
   THead extends readonly LayoutEntry[],
   TTail extends readonly LayoutEntry[]
@@ -52,11 +102,19 @@ export type InferPacketShape<
 };
 
 export class PacketValidationError extends Error {
-  constructor(public issues: string[]) {
-    super(issues.join('; '));
+  constructor(public issues: string[], options?: { cause?: unknown }) {
+    super(issues.join('; '), options);
     this.name = 'PacketValidationError';
   }
 }
+
+const toValidationError = (e: unknown): PacketValidationError => {
+  if (e instanceof PacketValidationError) return e;
+  const message = e instanceof Error ? e.message : String(e);
+  // cause сохраняет исходный стек — иначе программные ошибки внутри
+  // calculate()/схемы становятся неотлаживаемыми.
+  return new PacketValidationError([message], { cause: e });
+};
 
 export function struct<
   THead extends readonly LayoutEntry[],
@@ -75,20 +133,33 @@ export function struct<
   let currentOffset = 0;
   let bodyFieldDef: DataFieldDef | undefined;
 
-  // Безопасный резолвер для DataField (возвращает строго FieldDef<number> | undefined)
+  // Резолвер для DataField. Проверяет kind: ссылка на data-поле раньше
+  // приводила к тихому no-op при записи длины (buf.set(number)) — пакет
+  // уходил битым без единой ошибки.
   const resolveLengthField = (name: string): FieldDef<number> | undefined => {
     const field = resolvedFields[name];
-    // Проверяем, что поле найдено и его тип number (так как у u8/u16 тип выводится как number)
-    return field as FieldDef<number> | undefined;
+    if (!field) return undefined;
+    if (field.kind !== 'uint') {
+      throw new Error(
+        `Schema Error: Length field "${name}" must be an unsigned integer (u8/u16.le/…), got a "${field.kind}" field.`,
+      );
+    }
+    return field as FieldDef<number>;
   };
 
-  const compileBlock = (block?: readonly LayoutEntry[]) => {
+  const compileBlock = (blockName: 'head' | 'tail', block?: readonly LayoutEntry[]) => {
     if (!block) return;
 
     for (const entry of block) {
 
       if (isField(entry)) {
         const [name, type] = entry;
+        if (typeof (type as Partial<TypeDef<unknown>>)?.at !== 'function') {
+          throw new Error(
+            `Schema Error: Field "${name}" in "${blockName}" has no codec. `
+            + 'Multi-byte integers require explicit endianness: use u16.be / u16.le (u32.be / u32.le).',
+          );
+        }
         if (Object.hasOwn(resolvedFields, name)) {
           throw new Error(`Schema Error: Duplicate field name "${name}".`);
         }
@@ -101,9 +172,11 @@ export function struct<
     }
   };
 
-  compileBlock(schema.head);
+  compileBlock('head', schema.head);
 
   if (schema.body) {
+    // Валидируем ссылку на length-поле в момент компиляции схемы,
+    // включая его kind (см. resolveLengthField).
     if (schema.body.lengthField && !resolveLengthField(schema.body.lengthField)) {
       throw new Error(
         `Schema Error: Length field "${schema.body.lengthField}" must exist in head before body.`,
@@ -114,7 +187,7 @@ export function struct<
     currentOffset += bodyFieldDef.size;
   }
 
-  compileBlock(schema.tail);
+  compileBlock('tail', schema.tail);
 
   if (currentOffset !== schema.size) {
     throw new Error(
@@ -123,37 +196,69 @@ export function struct<
     );
   }
 
-  if (schema.checksum && !resolvedFields[schema.checksum.field]) {
-    throw new Error(`Schema Error: Checksum field "${schema.checksum.field}" not found in layout.`);
+  let checksumFieldDef: FieldDef<number> | undefined;
+  if (schema.checksum) {
+    const field = resolvedFields[schema.checksum.field];
+    if (!field) {
+      throw new Error(`Schema Error: Checksum field "${schema.checksum.field}" not found in layout.`);
+    }
+    if (field.kind !== 'uint') {
+      // Раньше encode на data-поле тихо пропускал запись checksum —
+      // пакет уходил без контрольной суммы. Теперь это ошибка схемы.
+      throw new Error(
+        `Schema Error: Checksum field "${schema.checksum.field}" must be an unsigned integer (u8/u16.le/…), got a "${field.kind}" field.`,
+      );
+    }
+    checksumFieldDef = field as FieldDef<number>;
   }
 
   const headKeys = extractFieldsKeys(schema.head)
   const tailKeys = extractFieldsKeys(schema.tail)
   const checksum = schema.checksum;
-  const readonlyResolvedFields = Object.freeze(resolvedFields) as Readonly<Record<string, FieldDef<unknown>>>;
+  const readonlyResolvedFields = Object.freeze(resolvedFields) as ResolvedFields<THead, TTail>;
 
   const calculateChecksum = (buffer: Uint8Array): number => {
-    if (!checksum) throw new Error('Schema Error: Checksum is not configured.');
-    const checksumField = resolvedFields[checksum.field];
-    if (!checksumField) throw new Error(`Schema Error: Checksum field "${checksum.field}" not found in layout.`);
+    if (!checksum || !checksumFieldDef) throw new Error('Schema Error: Checksum is not configured.');
+    const { offset, size } = checksumFieldDef;
 
-    const input = buffer.slice();
-    checksumField.encode(input, 0);
-    const value = checksum.calculate(input);
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new RangeError(`Checksum must be a non-negative safe integer, got ${value}`);
+    // Без копии всего буфера: зануляем поле НА МЕСТЕ, считаем, восстанавливаем.
+    // Полная копия на каждый encode И decode — лишний GC-трафик на 1000 Гц
+    // polling'а. Сохраняем только 1–4 байта самого поля; finally гарантирует,
+    // что буфер вызывающего вернётся в исходное состояние даже если
+    // calculate бросит исключение.
+    const saved = buffer.slice(offset, offset + size);
+    buffer.fill(0, offset, offset + size);
+    try {
+      const value = checksum.calculate(buffer, { offset, size });
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new RangeError(`Checksum must be a non-negative safe integer, got ${value}`);
+      }
+      return value;
+    } finally {
+      buffer.set(saved, offset);
     }
-    return value;
   };
 
-  function encodeBlock(fields: readonly string[], input: Record<string, unknown>, buffer: Uint8Array) {
-    for (const key of fields) {
+  function encodeBlock(
+    blockName: 'head' | 'tail',
+    keys: readonly string[],
+    input: Record<string, unknown> | undefined,
+    buffer: Uint8Array,
+  ) {
+    if (keys.length === 0) return;
+    if (input === undefined || input === null) {
+      throw new Error(`Missing "${blockName}" block: expected fields ${keys.map(k => `"${k}"`).join(', ')}.`);
+    }
+    for (const key of keys) {
       const def = resolvedFields[key];
       if (!def) continue;
       const val = input[key];
-      if (val !== undefined) {
-        def.encode(buffer, val);
+      if (val === undefined) {
+        // Раньше пропущенное поле тихо кодировалось нулём — 0x00 улетал
+        // в устройство как валидная команда. Теперь это ошибка.
+        throw new Error(`Missing value for field "${key}" in "${blockName}".`);
       }
+      def.encode(buffer, val);
     }
   }
 
@@ -177,35 +282,28 @@ export function struct<
     resolvedFields: readonlyResolvedFields,
 
     safeEncode(
-      input: InferPacketShape<THead, TTail>
+      input: PacketInput<THead, TTail>
     ): { success: true; buffer: Uint8Array } | { success: false; error: PacketValidationError } {
       try {
         const buffer = new Uint8Array(schema.size);
+        const blocks = input as { head?: Record<string, unknown>; body?: Uint8Array; tail?: Record<string, unknown> };
 
-        // `as Record<string, unknown>` — это безопасное расширение типа (widening),
-        // так как любой объект с конкретными ключами совместим с Record<string, unknown>.
-        if (schema.head) encodeBlock(headKeys, input.head as Record<string, unknown>, buffer);
+        encodeBlock('head', headKeys, blocks.head, buffer);
 
-        // Никаких @ts-ignore! bodyFieldDef.encode ожидает Uint8Array, и мы передаем Uint8Array.
         if (bodyFieldDef) {
-          bodyFieldDef.encode(buffer, input.body ?? new Uint8Array(0));
+          bodyFieldDef.encode(buffer, blocks.body ?? new Uint8Array(0));
         }
 
-        // ?? as Record<string, unknown>
-        if (schema.tail) encodeBlock(tailKeys, input.tail as Record<string, unknown>, buffer);
+        encodeBlock('tail', tailKeys, blocks.tail, buffer);
 
-        if (schema.checksum) {
-          const crcDef = resolvedFields[schema.checksum.field];
-          if (crcDef) {
-            const crcValue = calculateChecksum(buffer);
-            crcDef.encode(buffer, crcValue);
-          }
+        if (checksum && checksumFieldDef) {
+          const crcValue = calculateChecksum(buffer);
+          checksumFieldDef.encode(buffer, crcValue);
         }
 
         return { success: true, buffer };
       } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        return { success: false, error: new PacketValidationError([message]) };
+        return { success: false, error: toValidationError(e) };
       }
     },
 
@@ -230,17 +328,11 @@ export function struct<
 
         const tail = (schema.tail ? decodeBlock(tailKeys, buffer) : {}) as InferTupleFields<TTail>;
 
-        if (schema.checksum) {
-          const crcDef = resolvedFields[schema.checksum.field];
-          if (crcDef) {
-            const expectedCrc = crcDef.decode(buffer);
-            if (typeof expectedCrc !== 'number') {
-              throw new Error(`Checksum field "${schema.checksum.field}" must decode to a number`);
-            }
-            const actualCrc = calculateChecksum(buffer);
-            if (expectedCrc !== actualCrc) {
-              throw new Error(`CRC mismatch: expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}`);
-            }
+        if (checksum && checksumFieldDef) {
+          const expectedCrc = checksumFieldDef.decode(buffer);
+          const actualCrc = calculateChecksum(buffer);
+          if (expectedCrc !== actualCrc) {
+            throw new Error(`CRC mismatch: expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}`);
           }
         }
 
@@ -249,12 +341,11 @@ export function struct<
           data: { head, body, tail } as InferPacketShape<THead, TTail>
         };
       } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        return { success: false, error: new PacketValidationError([message]) };
+        return { success: false, error: toValidationError(e) };
       }
     },
 
-    encode(input: InferPacketShape<THead, TTail>): Uint8Array {
+    encode(input: PacketInput<THead, TTail>): Uint8Array {
       const res = codec.safeEncode(input);
       if (!res.success) throw res.error;
       return res.buffer;
