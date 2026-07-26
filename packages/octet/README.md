@@ -6,16 +6,17 @@ field offsets are resolved ahead of time; encode/decode on the hot path
 never re-parse the layout.
 
 ```ts
-import { struct, u8, u16, data, skip } from '@open-driver/octet';
+import { struct, u8, u16, data, magic } from '@open-driver/octet';
 
 const SetDpiPacket = struct({
-  size: 8,
+  size: 9,
   head: [
+    magic(u8, 0xa5),       // sync byte: auto-written on encode, checked on decode
     ['command', u8],
     ['dpi', u16.le],       // byte order is always explicit
-    skip(1),               // reserved bytes must be explicit
+    ['length', u8],
   ] as const,              // `as const` is required for field name inference
-  body: data({ lengthField: 'command', maxLength: 3 }),
+  body: data({ lengthField: 'length', maxLength: 3 }),
   tail: [['crc', u8]] as const,
   checksum: {
     field: 'crc',
@@ -24,7 +25,7 @@ const SetDpiPacket = struct({
 });
 
 const bytes = SetDpiPacket.encode({
-  head: { command: 0x04, dpi: 1600 },
+  head: { command: 0x04, dpi: 1600, length: 0 }, // length is overwritten with the body length
   body: new Uint8Array([1, 2]),
   tail: { crc: 0 },        // overwritten with the computed checksum
 });
@@ -49,15 +50,26 @@ declared fields, is an error (`Missing value for field "x" in "head"`) —
 not a silent `0x00` sent to the device. The one exception is `body`: it may
 be omitted, which means an empty payload.
 
-**Encode write order**: head → body → tail → checksum. If the body has a
-`lengthField`, the actual payload length overwrites whatever value the user
-passed in head. Bytes in `skip()` regions and the body tail beyond the
-payload remain zero.
+**Magic constants.** `magic(u8, 0xa5)` is an unnamed layout entry, like
+`skip()`: encode writes the constant automatically (it is not part of the
+input), decode does not include it in the result — its value is guaranteed
+by the schema. Out-of-range values (`magic(u8, 0x1ff)`) are rejected when
+the schema is described, not at the first encode.
 
-**Decode validates.** The buffer size must match the schema `size`. The
-length read from `lengthField` is validated against `maxLength` (protection
-against corrupted or hostile packets). With a checksum configured, a
-mismatch is a `CRC mismatch` error. The returned `body` is an owned copy
+**Encode write order**: magic constants → head → body → tail → checksum
+(so magic bytes participate in the sum). If the body has a `lengthField`,
+the actual payload length overwrites whatever value the user passed in
+head. Bytes in `skip()` regions and the body tail beyond the payload
+remain zero.
+
+**Decode validates, strictly in this order**: buffer size → magic
+constants → checksum → fields. Magic before checksum: a packet of another
+type with a valid CRC is diagnosed as `Magic mismatch` (wrong packet), not
+as a confusing `CRC mismatch` — useful when dispatching `safeDecode`
+across several schemas. Checksum before fields: a corrupted length byte is
+reported as `CRC mismatch`, not as a random field error. The length read
+from `lengthField` is validated against `maxLength` (protection against
+corrupted or hostile packets). The returned `body` is an owned copy
 (`slice`), not an alias of the input buffer. A body without a `lengthField`
 is returned in full (`maxLength` bytes), padding included.
 
@@ -105,7 +117,7 @@ marketing material. (History: exactly this benchmark rejected a
 "cleaner" DataView-based integer codec — it measured ~9x slower than
 the manual shifts on primitives.)
 
-Tests are sliced by behavior: `uint` / `data` / `schema` (schema
-compilation errors) / `codec` (encode/decode) / `checksum` / `errors`
-(error contract) / `property` (deterministic fuzzing of round-trips and
-corruption detection).
+Tests are sliced by behavior: `uint` / `data` / `magic` (protocol
+constants) / `schema` (schema compilation errors) / `codec`
+(encode/decode) / `checksum` / `errors` (error contract) / `property`
+(deterministic fuzzing of round-trips and corruption detection).

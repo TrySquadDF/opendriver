@@ -132,6 +132,9 @@ export function struct<
 
   let currentOffset = 0;
   let bodyFieldDef: DataFieldDef | undefined;
+  // Константы протокола: пишутся при encode автоматически,
+  // валидируются при decode до checksum и полей.
+  const magicDefs: Array<{ def: FieldDef<number>; value: number }> = [];
 
   // Резолвер для DataField. Проверяет kind: ссылка на data-поле раньше
   // приводила к тихому no-op при записи длины (buf.set(number)) — пакет
@@ -166,6 +169,12 @@ export function struct<
         resolvedFields[name] = type.at(currentOffset);
 
         currentOffset += type.size;
+      } else if ('magic' in entry) {
+        magicDefs.push({
+          def: entry.magic.type.at(currentOffset),
+          value: entry.magic.value,
+        });
+        currentOffset += entry.magic.type.size;
       } else {
         currentOffset += entry.skip;
       }
@@ -288,6 +297,11 @@ export function struct<
         const buffer = new Uint8Array(schema.size);
         const blocks = input as { head?: Record<string, unknown>; body?: Uint8Array; tail?: Record<string, unknown> };
 
+        // Константы схемы — до checksum: magic-байты участвуют в сумме.
+        for (const m of magicDefs) {
+          m.def.encode(buffer, m.value);
+        }
+
         encodeBlock('head', headKeys, blocks.head, buffer);
 
         if (bodyFieldDef) {
@@ -315,6 +329,30 @@ export function struct<
           throw new Error(`Buffer size ${buffer.length} does not match schema size ${schema.size}`);
         }
 
+        // Порядок валидации: size → magic → checksum → поля.
+        // Magic раньше CRC: пакет ДРУГОГО типа с валидной суммой диагностируется
+        // как «не тот пакет», а не как загадочный CRC mismatch (сценарий
+        // диспетчеризации safeDecode по нескольким схемам). Проверка дешёвая.
+        for (const m of magicDefs) {
+          const got = m.def.decode(buffer);
+          if (got !== m.value) {
+            throw new Error(
+              `Magic mismatch at offset ${m.def.offset}: expected 0x${m.value.toString(16)}, got 0x${got.toString(16)}`,
+            );
+          }
+        }
+
+        // CRC раньше декодирования полей: у битого пакета мог пострадать сам
+        // байт длины — без этого пользователь получал «Data length exceeds max
+        // capacity» вместо честного «CRC mismatch».
+        if (checksum && checksumFieldDef) {
+          const expectedCrc = checksumFieldDef.decode(buffer);
+          const actualCrc = calculateChecksum(buffer);
+          if (expectedCrc !== actualCrc) {
+            throw new Error(`CRC mismatch: expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}`);
+          }
+        }
+
         // `as InferTupleFields<THead>` — это безопасное сужение типа (narrowing),
         // так как decodeBlock возвращает Record<string, unknown>, а мы знаем структуру из схемы.
         const head = (schema.head ? decodeBlock(headKeys, buffer) : {}) as InferTupleFields<THead>;
@@ -327,14 +365,6 @@ export function struct<
         }
 
         const tail = (schema.tail ? decodeBlock(tailKeys, buffer) : {}) as InferTupleFields<TTail>;
-
-        if (checksum && checksumFieldDef) {
-          const expectedCrc = checksumFieldDef.decode(buffer);
-          const actualCrc = calculateChecksum(buffer);
-          if (expectedCrc !== actualCrc) {
-            throw new Error(`CRC mismatch: expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}`);
-          }
-        }
 
         return {
           success: true,

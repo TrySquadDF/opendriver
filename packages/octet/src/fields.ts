@@ -40,7 +40,17 @@ export interface DataFieldFactory extends TypeDef<Uint8Array> {
   at(offset: number, resolveLengthField?: (name: string) => FieldDef<number> | undefined): DataFieldDef;
 }
 
-export type LayoutEntry = readonly [name: string, type: TypeDef<unknown>] | { skip: number };
+// Константа протокола (sync/magic-байты) — безымянная запись layout'а, как skip:
+// её не передают в encode (пишется автоматически) и её нет в результате decode
+// (значение гарантировано схемой). Decode валидирует её ДО checksum и полей.
+export interface MagicEntry {
+  readonly magic: {
+    readonly type: TypeDef<number>;
+    readonly value: number;
+  };
+}
+
+export type LayoutEntry = readonly [name: string, type: TypeDef<unknown>] | { skip: number } | MagicEntry;
 
 // Предикат: является ли запись layout'а полем (tuple), а не skip-маркером.
 // Вынесен отдельно, чтобы в рекурсивных conditional types TS корректно сужал
@@ -262,6 +272,24 @@ export const data = (opts: { lengthField?: string; maxLength: number }): DataFie
 export const skip = (bytes: number): LayoutEntry => {
   assertNonNegativeInteger(bytes, 'Skip size');
   return Object.freeze({ skip: bytes });
+};
+
+// Сигнатура принимает только TypeDef<number> — bare u16/u32 (EndianTypeDef)
+// не проходит уже на уровне типов; runtime-проверки дублируют это для JS.
+export const magic = (type: TypeDef<number>, value: number): MagicEntry => {
+  if (typeof (type as Partial<TypeDef<number>>)?.at !== 'function') {
+    throw new Error(
+      'Magic type has no codec. '
+      + 'Multi-byte integers require explicit endianness: use u16.be / u16.le (u32.be / u32.le).',
+    );
+  }
+  if (type.kind !== 'uint') {
+    throw new Error(`Magic value must use an unsigned integer type (u8/u16.le/…), got a "${type.kind}" type.`);
+  }
+  // Пробная запись валидирует диапазон СРАЗУ (на этапе описания схемы):
+  // magic(u8, 0x1ff) бросит RangeError здесь, а не при первом encode.
+  type.write(new Uint8Array(type.size), 0, value);
+  return Object.freeze({ magic: Object.freeze({ type, value }) });
 };
 
 export const isField = (e: LayoutEntry): e is readonly [string, TypeDef<unknown>] => Array.isArray(e);

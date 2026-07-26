@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { PacketValidationError, skip, struct, u16, u8 } from '../src';
+import { PacketValidationError, data, skip, struct, u16, u8 } from '../src';
 
 const bytes = (buffer: Uint8Array) => Array.from(buffer);
 
@@ -130,6 +130,35 @@ describe('checksum', () => {
 
     expect(Packet.safeDecode(buf).success).toBe(false);
     expect(bytes(buf)).toEqual(snapshot);
+  });
+
+  it('reports CRC mismatch, not a field error, when the length byte is corrupted', () => {
+    const Packet = struct({
+      size: 5,
+      head: [['length', u8]] as const,
+      body: data({ lengthField: 'length', maxLength: 3 }),
+      tail: [['crc', u8]] as const,
+      checksum: { field: 'crc', calculate: sumWithoutLast },
+    });
+
+    const encoded = Packet.encode({
+      head: { length: 0 },
+      body: new Uint8Array([1, 2]),
+      tail: { crc: 0 },
+    });
+
+    // Портим сам байт длины: 255 > maxLength 3. CRC проверяется ДО полей,
+    // иначе диагноз был бы «Data length exceeds max capacity» вместо честного
+    // «пакет битый».
+    const tampered = new Uint8Array(encoded);
+    tampered[0] = 0xff;
+
+    const result = Packet.safeDecode(tampered);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toMatch(/CRC mismatch/);
+      expect(result.error.message).not.toMatch(/exceeds max capacity/);
+    }
   });
 
   it('zeroes the checksum field in the buffer passed to calculate', () => {

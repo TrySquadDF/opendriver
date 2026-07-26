@@ -9,7 +9,7 @@
  *   выражение на строке минимальным, чтобы не замаскировать опечатку);
  * - весь код обёрнут в неисполняемые замыкания.
  */
-import { struct, u8, u16, u32, data } from '../src';
+import { struct, u8, u16, u32, data, magic } from '../src';
 import type { FieldDef } from '../src';
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
@@ -84,6 +84,40 @@ const _checksumTypoIsError = () => struct({
     calculate: () => 0,
   },
 });
+
+// ── magic: константы не участвуют ни во входе encode, ни в результате decode ─
+const makeMagicPacket = () => struct({
+  size: 5,
+  head: [
+    magic(u8, 0xa5),
+    ['cmd', u8],
+  ] as const,
+  tail: [
+    magic(u16.be, 0x0d0a),
+    ['crc', u8],
+  ] as const,
+});
+
+type MagicDecoded = ReturnType<ReturnType<typeof makeMagicPacket>['decode']>;
+type _magicNotInHead = Expect<Equal<MagicDecoded['head'], { cmd: number }>>;
+type _magicNotInTail = Expect<Equal<MagicDecoded['tail'], { crc: number }>>;
+
+const _magicNotRequiredInInput = () =>
+  makeMagicPacket().encode({ head: { cmd: 1 }, tail: { crc: 0 } });
+
+// Блок только из констант — во входе не обязателен.
+const _magicOnlyBlockIsOptional = () => {
+  const P = struct({ size: 2, head: [magic(u16.be, 0xbeef)] as const });
+  return P.encode({});
+};
+
+const _bareU16MagicIsError = () =>
+  // @ts-expect-error bare u16 has no codec — use u16.be / u16.le
+  magic(u16, 0xffff);
+
+const _dataMagicIsError = () =>
+  // @ts-expect-error magic requires an unsigned integer type
+  magic(data({ maxLength: 2 }), 0);
 
 // ── Дубликаты имён — ошибка типов ────────────────────────────────────────────
 const _duplicateInHeadIsError = () =>
