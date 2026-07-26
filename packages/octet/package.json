@@ -1,0 +1,30 @@
+{
+  "name": "@open-driver/octet",
+  "type": "module",
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist/**/*"
+  ],
+  "private": true,
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "test:coverage": "bun test --coverage"
+  },
+  "devDependencies": {
+    "tsdown": "0.22.4",
+    "typescript": "catalog:",
+    "@types/bun": "catalog:"
+  }
+}

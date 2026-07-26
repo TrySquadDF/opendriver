@@ -1,0 +1,12 @@
+[test]
+# Pure unit tests (Uint8Array / binary DSL). Coverage: `bun test --coverage`.
+coverageReporter = ["text", "lcov"]
+coverageDir = "coverage"
+# Skip tests themselves; only measure src (and never dist / node_modules).
+coverageSkipTestFiles = true
+coveragePathIgnorePatterns = [
+  "dist/**",
+  "node_modules/**",
+  "test/**",
+  "**/*.test.ts",
+]
